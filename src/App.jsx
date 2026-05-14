@@ -603,6 +603,7 @@ function MockTest({ onScore }) {
   // Question bank from PDFs — stored per subject
   const [questionBanks, setQuestionBanks] = useLocalStorage("medmentor_question_banks", {});
   const bankFileRef = useRef(null);
+  const bankAiFileRef = useRef(null);
   const [bankProcessing, setBankProcessing] = useState(false);
 
   // State for current test session — persisted to localStorage for save/resume
@@ -618,41 +619,95 @@ function MockTest({ onScore }) {
   const bankCount = subjects.reduce((sum, s) => sum + (questionBanks[s]?.length || 0), 0);
   const totalBankCount = Object.values(questionBanks).reduce((sum, qs) => sum + qs.length, 0);
 
-  // Process uploaded PDF into question bank
-  const processBankPdf = async (file, targetSubject) => {
-    setBankProcessing(true);
-    setLoadingMsg(`Parsing "${file.name}"...`);
-    try {
-      let text;
-      if (file.type === "application/pdf") {
-        await ensurePdfJs();
-        const ab = await file.arrayBuffer();
-        const pdf = await window.pdfjsLib.getDocument({ data: ab }).promise;
-        const pages = [];
-        for (let i = 1; i <= pdf.numPages; i++) {
-          const page = await pdf.getPage(i);
-          const tc = await page.getTextContent();
-          pages.push(tc.items.map(it => it.str).join(" "));
-          setLoadingMsg(`Parsing "${file.name}" — page ${i}/${pdf.numPages}...`);
+  // Extract raw text from a PDF or text file
+  const extractFileText = async (file, onProgress) => {
+    if (file.type === "application/pdf") {
+      await ensurePdfJs();
+      const ab = await file.arrayBuffer();
+      const pdf = await window.pdfjsLib.getDocument({ data: ab }).promise;
+      const pages = [];
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const tc = await page.getTextContent();
+        // Join items preserving newlines based on y-position changes
+        let lastY = null;
+        let lineText = "";
+        const pageLines = [];
+        for (const item of tc.items) {
+          if (lastY !== null && Math.abs(item.transform[5] - lastY) > 2) {
+            if (lineText.trim()) pageLines.push(lineText.trim());
+            lineText = "";
+          }
+          lineText += item.str;
+          lastY = item.transform[5];
         }
-        text = pages.join("\n");
-      } else {
-        text = await new Promise((res, rej) => { const r = new FileReader(); r.onload = e => res(e.target.result); r.onerror = rej; r.readAsText(file); });
+        if (lineText.trim()) pageLines.push(lineText.trim());
+        pages.push(pageLines.join("\n"));
+        onProgress && onProgress(i, pdf.numPages);
       }
-      setLoadingMsg("Extracting questions...");
-      const parsed = parseMcqText(text);
+      return pages.join("\n\n");
+    } else {
+      return new Promise((res, rej) => { const r = new FileReader(); r.onload = e => res(e.target.result); r.onerror = rej; r.readAsText(file); });
+    }
+  };
+
+  // AI-assisted PDF parsing — sends chunks of raw text to Gemini to extract MCQs
+  const aiParsePdf = async (text, targetSubject, fileName) => {
+    const CHUNK = 6000; // chars per AI call
+    const chunks = [];
+    for (let i = 0; i < text.length; i += CHUNK) chunks.push(text.slice(i, i + CHUNK));
+    
+    const allQuestions = [];
+    for (let ci = 0; ci < chunks.length; ci++) {
+      setLoadingMsg(`AI parsing chunk ${ci + 1}/${chunks.length}...`);
+      try {
+        const raw = await claudeOnce(
+          `You are an MCQ extractor. Extract ALL multiple choice questions from the following text.
+Return ONLY a valid JSON array, no explanation, no markdown.
+Format: [{"q":"question text","options":["A. option","B. option","C. option","D. option"],"answer":"A","explanation":"if present, else empty string"}]
+If no answer key is given, put your best guess for "answer".
+Text:\n${chunks[ci]}`,
+          "Extract MCQs"
+        );
+        const parsed = JSON.parse(raw.replace(/```json|```/g, "").trim());
+        if (Array.isArray(parsed)) allQuestions.push(...parsed);
+      } catch (e) { /* skip bad chunk */ }
+    }
+    return allQuestions;
+  };
+
+  // Process uploaded PDF into question bank — tries regex first, then AI
+  const processBankPdf = async (file, targetSubject, forceAi = false) => {
+    setBankProcessing(true);
+    setLoadingMsg(`Reading "${file.name}"...`);
+    try {
+      const text = await extractFileText(file, (cur, tot) => setLoadingMsg(`Reading page ${cur}/${tot}...`));
+
+      let parsed = [];
+      if (!forceAi) {
+        setLoadingMsg("Trying fast extraction (regex)...");
+        parsed = parseMcqText(text);
+      }
+
+      if (parsed.length < 3 || forceAi) {
+        // Regex failed or user forced AI — use AI parser
+        setLoadingMsg(`Regex found ${parsed.length} questions. Switching to AI parser...`);
+        await new Promise(r => setTimeout(r, 600));
+        parsed = await aiParsePdf(text, targetSubject, file.name);
+      }
+
       if (parsed.length === 0) {
-        alert(`Could not extract any MCQs from "${file.name}". Make sure the PDF has numbered questions with A/B/C/D options.`);
-      } else {
-        // Tag each question with the subject
-        const tagged = parsed.map(q => ({ ...q, subject: targetSubject }));
-        setQuestionBanks(prev => ({
-          ...prev,
-          [targetSubject]: [...(prev[targetSubject] || []), ...tagged]
-        }));
-        alert(`✅ Extracted ${parsed.length} questions from "${file.name}" into ${targetSubject} bank!`);
+        alert(`Could not extract any MCQs from "${file.name}" even with AI.\n\nWorkarounds:\n• Make sure the PDF is not scanned/image-based (it must be selectable text)\n• Try copying questions into a .txt file manually and upload that\n• Use AI Generate mode instead`);
+        return;
       }
-    } catch (e) { alert("Error parsing PDF: " + e.message); }
+
+      const tagged = parsed.map(q => ({ ...q, subject: targetSubject }));
+      setQuestionBanks(prev => ({
+        ...prev,
+        [targetSubject]: [...(prev[targetSubject] || []), ...tagged]
+      }));
+      alert(`✅ Extracted ${tagged.length} questions from "${file.name}" into ${targetSubject} bank!\n\n(${forceAi || parsed.length < 3 ? "Used AI parser" : "Used fast regex parser"})`);
+    } catch (e) { alert("Error parsing file: " + e.message); }
     finally { setBankProcessing(false); setLoadingMsg(""); }
   };
 
@@ -944,20 +999,34 @@ Clinical vignette style. Exam-level.`,
           </div>
 
           {/* Upload for specific subject */}
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
             <select id="bank-subject-select" style={{ ...sel, minWidth: 160 }} defaultValue={subjects[0]}>
               {SUBJECTS.map(s => <option key={s} value={s}>{SUBJECT_DATA[s].icon} {s}</option>)}
             </select>
-            <button disabled={bankProcessing} style={{ ...mkBtn(G.gradGreen), padding: "10px 22px", fontSize: 13, opacity: bankProcessing ? 0.6 : 1 }}
+            <button disabled={bankProcessing} style={{ ...mkBtn(G.gradGreen), padding: "10px 18px", fontSize: 12, opacity: bankProcessing ? 0.6 : 1 }}
               onClick={() => bankFileRef.current?.click()}>
-              {bankProcessing ? "⏳ Processing..." : "📤 Upload PDF"}
+              {bankProcessing ? "⏳ Processing..." : "⚡ Fast Upload"}
             </button>
+            <button disabled={bankProcessing} style={{ ...mkBtn(G.gradViolet), padding: "10px 18px", fontSize: 12, opacity: bankProcessing ? 0.6 : 1 }}
+              onClick={() => bankAiFileRef.current?.click()}>
+              {bankProcessing ? "⏳ Processing..." : "🤖 AI Parse Upload"}
+            </button>
+            {/* Fast regex parse */}
             <input ref={bankFileRef} type="file" accept=".pdf,.txt,.md" style={{ display: "none" }}
               onChange={e => {
                 const file = e.target.files?.[0];
                 if (!file) return;
                 const subj = document.getElementById("bank-subject-select")?.value || subjects[0];
-                processBankPdf(file, subj);
+                processBankPdf(file, subj, false);
+                e.target.value = "";
+              }} />
+            {/* Force AI parse */}
+            <input ref={bankAiFileRef} type="file" accept=".pdf,.txt,.md" style={{ display: "none" }}
+              onChange={e => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                const subj = document.getElementById("bank-subject-select")?.value || subjects[0];
+                processBankPdf(file, subj, true);
                 e.target.value = "";
               }} />
             {totalBankCount > 0 && (
